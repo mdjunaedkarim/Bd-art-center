@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AR আঁকা</string>
+    <string name="pick_image">ছবি বাছাই</string>
+    <string name="rotate">ঘোরাও</string>
+    <string name="reset">রিসেট</string>
+    <string name="opacity">স্বচ্ছতা</string>
+    <string name="searching">খাতার পুরো পাতাটা ক্যামেরায় ধরুন…</string>
+    <string name="need_image">আগে একটা ছবি বাছাই করুন</string>
+    <string name="tracking">খাতা পাওয়া গেছে ✓</string>
+    <string name="camera_denied">ক্যামেরার অনুমতি ছাড়া অ্যাপ কাজ করবে না</string>
+    <string name="opencv_failed">OpenCV চালু করা যায়নি</string>
+    <string name="image_failed">ছবিটা খোলা যায়নি</string>
+</resources>
