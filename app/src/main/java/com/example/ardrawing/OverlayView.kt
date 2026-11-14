@@ -3,133 +3,224 @@ package com.example.ardrawing
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.Path
 import android.util.AttributeSet
+import android.view.MotionEvent
 import android.view.View
+import kotlin.math.atan2
 import kotlin.math.hypot
-import kotlin.math.max
-import kotlin.math.min
 
 class OverlayView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    var bitmap: Bitmap? = null
-        set(value) {
-            field = value
-            invalidate()
-        }
+    private var bitmap: Bitmap? = null
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-    var imageAlpha: Float = 0.5f
-        set(value) {
-            field = value
-            invalidate()
-        }
-
-    private var quad: FloatArray? = null
-    private var aspect = 0.75f
-    private var lastSeen = 0L
-    private var rot = 0
-    private var landscape = false
-    private var locked = false
-
-    private val imagePaint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 3f
-        color = Color.argb(160, 0, 255, 120)
-    }
+    private val userMatrix = Matrix()
     private val drawMatrix = Matrix()
-    private val path = Path()
+    private val lastGoodMatrix = Matrix()
+    private val camToView = Matrix()
+    private val viewToCam = Matrix()
+    private val homography = Matrix()
 
-    fun update(corners: FloatArray?, frameAspect: Float) {
-        if (corners != null) {
-            if (!locked) {
-                val d01 = hypot(
-                    (corners[2] - corners[0]) * frameAspect,
-                    corners[3] - corners[1]
-                )
-                val d12 = hypot(
-                    (corners[4] - corners[2]) * frameAspect,
-                    corners[5] - corners[3]
-                )
-                landscape = d01 > d12
-                locked = true
-            }
-            quad = corners
-            aspect = frameAspect
-            lastSeen = System.currentTimeMillis()
+    private var imageAlpha = 180
+    var isLocked = false
+        private set
+    private var trackingGood = true
+    private var initializedPlacement = false
+
+    private enum class Mode { NONE, DRAG, ZOOM_ROTATE }
+    private var mode = Mode.NONE
+    private var activePointerId = MotionEvent.INVALID_POINTER_ID
+    private var lastX = 0f
+    private var lastY = 0f
+    private var prevMidX = 0f
+    private var prevMidY = 0f
+    private var prevDist = 0f
+    private var prevAngle = 0f
+
+    fun setBitmap(bmp: Bitmap?) {
+        bitmap = bmp
+        initializedPlacement = false
+        isLocked = false
+        trackingGood = true
+        resetPlacement()
+        invalidate()
+    }
+
+    fun setOpacity(percent: Int) {
+        imageAlpha = (percent.coerceIn(5, 100) * 255) / 100
+        invalidate()
+    }
+
+    fun lock() {
+        isLocked = true
+        trackingGood = true
+        lastGoodMatrix.set(userMatrix)
+        drawMatrix.set(userMatrix)
+        invalidate()
+    }
+
+    fun unlock() {
+        isLocked = false
+        trackingGood = true
+        drawMatrix.set(userMatrix)
+        invalidate()
+    }
+
+    fun updateTracking(out: PlaneTracker.Out) {
+        if (!isLocked) return
+        trackingGood = out.good
+        if (!out.good || width == 0 || height == 0 || out.rw == 0 || out.rh == 0) {
+            invalidate()
+            return
         }
+
+        val vw = width.toFloat()
+        val vh = height.toFloat()
+        val rw = out.rw.toFloat()
+        val rh = out.rh.toFloat()
+
+        // PreviewView FILL_CENTER স্কেলিংয়ের সাথে ম্যাচ করা
+        val scale = maxOf(vw / rw, vh / rh)
+        val ox = (vw - rw * scale) / 2f
+        val oy = (vh - rh * scale) / 2f
+
+        camToView.reset()
+        camToView.setScale(scale, scale)
+        camToView.postTranslate(ox, oy)
+        camToView.invert(viewToCam)
+
+        homography.setValues(out.h)
+
+        drawMatrix.set(userMatrix)
+        drawMatrix.postConcat(viewToCam)
+        drawMatrix.postConcat(homography)
+        drawMatrix.postConcat(camToView)
+
+        lastGoodMatrix.set(drawMatrix)
         invalidate()
     }
 
-    fun rotateImage() {
-        rot = (rot + 1) % 4
-        invalidate()
+    private fun resetPlacement() {
+        val bmp = bitmap ?: return
+        if (width == 0 || height == 0) return
+
+        val targetW = width * 0.68f
+        val s = minOf(targetW / bmp.width, (height * 0.55f) / bmp.height)
+        val dx = (width - bmp.width * s) / 2f
+        val dy = (height - bmp.height * s) / 2f
+
+        userMatrix.reset()
+        userMatrix.postScale(s, s)
+        userMatrix.postTranslate(dx, dy)
+        drawMatrix.set(userMatrix)
+        lastGoodMatrix.set(userMatrix)
+        initializedPlacement = true
     }
 
-    fun resetLock() {
-        locked = false
-        quad = null
-        rot = 0
-        invalidate()
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (!initializedPlacement && bitmap != null) {
+            resetPlacement()
+        }
     }
-
-    val isTracking: Boolean
-        get() = quad != null && System.currentTimeMillis() - lastSeen < 800
 
     override fun onDraw(canvas: Canvas) {
-        val q = quad ?: return
-        if (!isTracking) return
-
-        val fw = aspect
-        val fh = 1f
-        val s = max(width / fw, height / fh)
-        val ox = (width - fw * s) / 2f
-        val oy = (height - fh * s) / 2f
-        val dst = FloatArray(8)
-        for (i in 0 until 4) {
-            val idx = (i + rot) % 4
-            dst[i * 2] = ox + q[idx * 2] * fw * s
-            dst[i * 2 + 1] = oy + q[idx * 2 + 1] * fh * s
-        }
-
-        path.reset()
-        path.moveTo(dst[0], dst[1])
-        path.lineTo(dst[2], dst[3])
-        path.lineTo(dst[4], dst[5])
-        path.lineTo(dst[6], dst[7])
-        path.close()
-        canvas.drawPath(path, outlinePaint)
-
+        super.onDraw(canvas)
         val bmp = bitmap ?: return
-        val bw = bmp.width.toFloat()
-        val bh = bmp.height.toFloat()
+        if (!initializedPlacement) resetPlacement()
 
-        val pageLandscape = if (rot % 2 == 0) landscape else !landscape
-        val pw = if (pageLandscape) 297f else 210f
-        val ph = if (pageLandscape) 210f else 297f
-
-        val scale = min(pw / bw, ph / bh)
-        val halfW = pw / (2f * scale)
-        val halfH = ph / (2f * scale)
-        val cx = bw / 2f
-        val cy = bh / 2f
-        val src = floatArrayOf(
-            cx - halfW, cy - halfH,
-            cx + halfW, cy - halfH,
-            cx + halfW, cy + halfH,
-            cx - halfW, cy + halfH
-        )
-
-        drawMatrix.reset()
-        if (drawMatrix.setPolyToPoly(src, 0, dst, 0, 4)) {
-            imagePaint.alpha = (imageAlpha * 255).toInt().coerceIn(0, 255)
-            canvas.drawBitmap(bmp, drawMatrix, imagePaint)
+        paint.alpha = if (isLocked && !trackingGood) (imageAlpha * 0.35f).toInt() else imageAlpha
+        val m = if (isLocked) {
+            if (trackingGood) drawMatrix else lastGoodMatrix
+        } else {
+            userMatrix
         }
+        canvas.drawBitmap(bmp, m, paint)
     }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (isLocked || bitmap == null) return false
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                activePointerId = event.getPointerId(0)
+                lastX = event.x
+                lastY = event.y
+                mode = Mode.DRAG
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2) {
+                    prevMidX = (event.getX(0) + event.getX(1)) / 2f
+                    prevMidY = (event.getY(0) + event.getY(1)) / 2f
+                    prevDist = distance(event)
+                    prevAngle = angle(event)
+                    mode = Mode.ZOOM_ROTATE
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (mode == Mode.DRAG) {
+                    val idx = event.findPointerIndex(activePointerId)
+                    if (idx >= 0) {
+                        val x = event.getX(idx)
+                        val y = event.getY(idx)
+                        userMatrix.postTranslate(x - lastX, y - lastY)
+                        lastX = x
+                        lastY = y
+                        invalidate()
+                    }
+                } else if (mode == Mode.ZOOM_ROTATE && event.pointerCount >= 2) {
+                    val midX = (event.getX(0) + event.getX(1)) / 2f
+                    val midY = (event.getY(0) + event.getY(1)) / 2f
+                    val dist = distance(event)
+                    val ang = angle(event)
+
+                    userMatrix.postTranslate(midX - prevMidX, midY - prevMidY)
+                    if (prevDist > 12f && dist > 12f) {
+                        val s = (dist / prevDist).coerceIn(0.5f, 2.0f)
+                        userMatrix.postScale(s, s, midX, midY)
+                    }
+                    val dDeg = Math.toDegrees((ang - prevAngle).toDouble()).toFloat()
+                    userMatrix.postRotate(dDeg, midX, midY)
+
+                    prevMidX = midX
+                    prevMidY = midY
+                    prevDist = dist
+                    prevAngle = ang
+                    invalidate()
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                val upIdx = event.actionIndex
+                val remainingIdx = if (upIdx == 0) 1 else 0
+                if (event.pointerCount > 1 && remainingIdx < event.pointerCount) {
+                    activePointerId = event.getPointerId(remainingIdx)
+                    lastX = event.getX(remainingIdx)
+                    lastY = event.getY(remainingIdx)
+                    mode = Mode.DRAG
+                } else {
+                    mode = Mode.NONE
+                }
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                mode = Mode.NONE
+                activePointerId = MotionEvent.INVALID_POINTER_ID
+            }
+        }
+        return true
+    }
+
+    private fun distance(e: MotionEvent): Float =
+        hypot(e.getX(1) - e.getX(0), e.getY(1) - e.getY(0))
+
+    private fun angle(e: MotionEvent): Float =
+        atan2(e.getY(1) - e.getY(0), e.getX(1) - e.getX(0))
 }
